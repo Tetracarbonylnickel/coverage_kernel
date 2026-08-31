@@ -1,0 +1,22 @@
+[project]
+name = "coverage_kernel"
+version = "0.1.0"
+description = "General conditioned-classifier kernel (pooled + grid schemes) for coverage-dependent surface reaction probabilities, with a Fortran inference port for DSMC boundary conditions."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "joblib",
+    "h5py",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["coverage_kernel*"]

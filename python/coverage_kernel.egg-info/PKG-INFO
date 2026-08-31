@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: coverage_kernel
+Version: 0.1.0
+Summary: General conditioned-classifier kernel (pooled + grid schemes) for coverage-dependent surface reaction probabilities, with a Fortran inference port for DSMC boundary conditions.
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: scikit-learn
+Requires-Dist: joblib
+Requires-Dist: h5py
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
