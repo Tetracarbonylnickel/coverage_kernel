@@ -15,6 +15,7 @@ add_library(coverage_kernel STATIC
   ${KERNEL_SRC}/MOD_CoverageKernel_BSpline.f90
   ${KERNEL_SRC}/MOD_CoverageKernel_Interp1D.f90
   ${KERNEL_SRC}/MOD_CoverageKernel_Classifier.f90
+  ${KERNEL_SRC}/MOD_CoverageKernel_MLP.f90
   ${KERNEL_SRC}/MOD_CoverageKernel_Grid.f90
   ${KERNEL_SRC}/MOD_CoverageKernel_IO.f90
   ${KERNEL_SRC}/MOD_CoverageKernel.f90

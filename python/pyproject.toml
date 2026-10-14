@@ -1,7 +1,7 @@
 [project]
 name = "coverage_kernel"
-version = "0.1.0"
-description = "General conditioned-classifier kernel (pooled + grid schemes) for coverage-dependent surface reaction probabilities, with a Fortran inference port for DSMC boundary conditions."
+version = "0.2.0"
+description = "Coverage-dependent branching-probability models (NN ensemble and grid scheme) for DSMC gas-surface boundary conditions, with a Fortran inference port."
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
@@ -12,6 +12,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+train = ["jax", "flax", "optax"]          # NN training (coverage_kernel.nn_train)
+data = ["pandas", "znh5md"]              # impact-data reader (coverage_kernel.data)
 test = ["pytest"]
 
 [build-system]

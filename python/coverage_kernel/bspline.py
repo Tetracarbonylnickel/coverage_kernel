@@ -3,7 +3,7 @@ bspline.py
 ==========
 Generic B-spline basis evaluation. Nothing here knows about coverage or any
 other domain concept -- it's pure basis-function math, reused by
-pooled_classifier.py and (per grid cell) by grid_classifier.py.
+spline_classifier.py (the per-cell classifier of grid_classifier.py).
 
 Matches scikit-learn's `SplineTransformer(knots="uniform", extrapolation=
 "constant", include_bias=False)` exactly: same knot-vector convention, same

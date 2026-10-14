@@ -239,7 +239,7 @@ END FUNCTION PchipEvalWindowVec
 !> MOD_CoverageKernel_IO reads it from HDF5 and how
 !> MOD_CoverageKernel_Grid's FlatIndex computes offsets), clipping the
 !> query into range on every axis first (never extrapolates). Used for the
-!> pooled scheme's ceiling grid, where the interpolated *value* is a smooth
+!> NN ensemble's ceiling grid, where the interpolated *value* is a smooth
 !> safety boundary (always linear, never pchip -- no shape-preservation
 !> concern, and the grid is cheap enough that lazy evaluation buys nothing
 !> here unlike the per-cell classifiers in MOD_CoverageKernel_Grid).

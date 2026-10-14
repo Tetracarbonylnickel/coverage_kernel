@@ -2,40 +2,36 @@
 !> Reads the HDF5 schema (docs/hdf5_schema.md) written by
 !> coverage_kernel/python/coverage_kernel/export_hdf5.py into a
 !> t_CoverageModel. Every shape quantity (n_classes, n_terms, grid shape,
-!> knot-vector length, ...) is discovered from the file itself via HDF5
-!> dataspace/attribute queries, never assumed.
+!> knot-vector length, layer widths, number of members) is discovered from
+!> the file itself, never assumed.
 !>
 !> 0-based -> 1-based index conversion (outcome-class indices, term raw-
-!> feature columns, gate indices) happens exactly here, nowhere else in
-!> the Fortran port -- everything past this module operates on 1-based
-!> Fortran indices only.
+!> feature columns, gate indices) happens exactly here.
 !>
-!> Every dataset with more than one leading grid/cell dimension is read as
-!> a flat 1-D buffer and indexed with the same C-order (last-axis-fastest)
-!> convention MOD_CoverageKernel_Interp1D's FlatIndexCOrder and
-!> MOD_CoverageKernel_Grid use -- never into a native multi-dimensional
-!> Fortran array. See docs/hdf5_schema.md's notes section for why: Fortran
-!> arrays are column-major but every array this schema stores is written
-!> in C-order (NumPy's default), so a direct multi-dim h5dread_f would
-!> silently transpose the data relative to what indexing Buf(i0+1,i1+1,...)
-!> should mean.
+!> Every dataset with more than one dimension is read as a flat 1-D buffer
+!> and indexed with the C-order (last-axis-fastest) convention of
+!> MOD_CoverageKernel_Interp1D's FlatIndexCOrder -- never into a native
+!> multi-dimensional Fortran array, which would silently transpose it.
+!>
+!> HDF5 library state: h5open_f is called (it is safe to call repeatedly),
+!> h5close_f is never called, so a host code that uses HDF5 itself (e.g.
+!> PICLas) keeps a working library. Every HDF5 call is checked; a file that
+!> exists but does not match the schema stops with a message naming the
+!> failing item.
 !==================================================================================================================================
 MODULE MOD_CoverageKernel_IO
 ! MODULES
 USE HDF5
 USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY: IEEE_IS_NAN
-USE MOD_CoverageKernel_Types,    ONLY: wp, NAME_LEN, t_Term, t_PooledClassifier, t_GridAxis, t_GridCell, &
-                                        t_PooledModel, t_GridModel, t_CoverageModel
-USE MOD_CoverageKernel_Interp1D, ONLY: FlatIndexCOrder
+USE MOD_CoverageKernel_Types,    ONLY: wp, NAME_LEN, t_Term, t_SplineClassifier, t_GridAxis, t_GridCell, &
+                                        t_GridModel, t_NNModel, t_MLP, t_CoverageModel
+USE MOD_CoverageKernel_MLP,      ONLY: IsKnownActivation
 IMPLICIT NONE
 PRIVATE
 !----------------------------------------------------------------------------------------------------------------------------
 PUBLIC :: ReadCoverageModelHDF5
 
-!> Wraps one flat REAL buffer -- used to hold one spline term's whole
-!> term_knots/<i> dataset (read once) while ReadGridModel slices per-cell
-!> knot vectors out of it in memory, since SIZE(Terms) buffers of
-!> different lengths can't be a plain rank-2 array.
+!> Wraps one flat REAL buffer (one spline term's whole term_knots/<i> dataset).
 TYPE :: t_FlatBuf
   REAL(wp), ALLOCATABLE :: Data(:)
 END TYPE t_FlatBuf
@@ -43,15 +39,11 @@ END TYPE t_FlatBuf
 CONTAINS
 
 !==================================================================================================================================
-!> Top-level HDF5 reader: opens FileName, dispatches to the pooled or grid
-!> reader based on the /scheme attribute, populates every field of Model.
-!> IErr is 0 on success, nonzero if the file could not be opened (the one
-!> failure mode a caller can reasonably expect to happen at runtime, e.g.
-!> a bad path). A malformed/incompatible file that opens fine but doesn't
-!> match this schema is treated as a programmer/build error, not a
-!> recoverable runtime condition, and still hits ERROR STOP directly
-!> inside the lower-level readers below -- see MOD_CoverageKernel's
-!> LoadCoverageModel for how IErr is surfaced (or not) to callers.
+!> Top-level reader. IErr = 0 on success, 1 if the file does not exist,
+!> 2 if it exists but HDF5 cannot open it. Everything after a successful
+!> open is a schema check that stops with a message on failure (a model file
+!> that opens but does not match the schema is a deployment error, not a
+!> runtime condition).
 !==================================================================================================================================
 SUBROUTINE ReadCoverageModelHDF5(FileName, Model, IErr)
 ! INPUT / OUTPUT VARIABLES
@@ -61,60 +53,80 @@ INTEGER,               INTENT(OUT) :: IErr
 ! LOCAL VARIABLES
 INTEGER(HID_T) :: FileID, TermsGroupID
 INTEGER        :: hdferr
+LOGICAL        :: Exists
 TYPE(t_Term), ALLOCATABLE :: Terms(:)
 !----------------------------------------------------------------------------------------------------------------------------
-CALL h5open_f(hdferr)
-CALL h5fopen_f(TRIM(FileName), H5F_ACC_RDONLY_F, FileID, hdferr)
-IF (hdferr /= 0) THEN
+INQUIRE(FILE=TRIM(FileName), EXIST=Exists)
+IF (.NOT. Exists) THEN
   IErr = 1
+  RETURN
+END IF
+CALL h5open_f(hdferr)
+CALL Chk(hdferr, "h5open_f", "")
+CALL h5fopen_f(TRIM(FileName), H5F_ACC_RDONLY_F, FileID, hdferr)
+IF (hdferr < 0) THEN
+  IErr = 2
   RETURN
 END IF
 IErr = 0
 
-Model%Scheme = H5ReadStrAttr(FileID, "scheme")
-Model%NSites = H5ReadIntAttr(FileID, "n_sites")
+Model%FormatVersion = H5ReadStrAttr(FileID, "format_version")
+IF (TRIM(Model%FormatVersion) /= "1.0" .AND. TRIM(Model%FormatVersion) /= "1.1") THEN
+  WRITE(*,*) "MOD_CoverageKernel_IO: ", TRIM(FileName), " has format_version '", TRIM(Model%FormatVersion), &
+             "', this reader supports 1.0 and 1.1"
+  ERROR STOP "MOD_CoverageKernel_IO: unsupported format_version"
+END IF
+Model%Scheme             = H5ReadStrAttr(FileID, "scheme")
+Model%NSites             = H5ReadIntAttr(FileID, "n_sites")
 Model%ZeroedZeroIndex    = H5ReadIntAttr(FileID, "zeroed_zero_index")    + 1
 Model%ZeroedFullIndex    = H5ReadIntAttr(FileID, "zeroed_full_index")    + 1
 Model%AbsorbingFullIndex = H5ReadIntAttr(FileID, "absorbing_full_index") + 1
-Model%NClasses = H5ReadIntAttr(FileID, "n_classes")
-Model%CoverageDelta = H5ReadRealFlat(FileID, "coverage_delta")
+Model%NClasses           = H5ReadIntAttr(FileID, "n_classes")
+Model%CoverageDelta      = H5ReadRealFlat(FileID, "coverage_delta")
+IF (SIZE(Model%CoverageDelta) /= Model%NClasses) ERROR STOP "MOD_CoverageKernel_IO: coverage_delta length /= n_classes"
 
 Model%HasModelArea = H5AttrExists(FileID, "model_area_nm2")
-IF (Model%HasModelArea) THEN
-  Model%ModelAreaNm2 = H5ReadRealAttr(FileID, "model_area_nm2")
-ELSE
-  Model%ModelAreaNm2 = 0.0_wp
-END IF
-
-CALL h5gopen_f(FileID, "terms", TermsGroupID, hdferr)
-CALL ReadTermSpec(TermsGroupID, Terms)
-CALL h5gclose_f(TermsGroupID, hdferr)
+Model%ModelAreaNm2 = 0.0_wp
+IF (Model%HasModelArea) Model%ModelAreaNm2 = H5ReadRealAttr(FileID, "model_area_nm2")
 
 SELECT CASE (TRIM(Model%Scheme))
-CASE ("pooled")
-  CALL ReadPooledModel(FileID, Terms, Model%NClasses, Model%Pooled)
 CASE ("grid")
+  CALL h5gopen_f(FileID, "terms", TermsGroupID, hdferr)
+  CALL Chk(hdferr, "open group", "terms")
+  CALL ReadTermSpec(TermsGroupID, Terms)
+  CALL h5gclose_f(TermsGroupID, hdferr)
   CALL ReadGridModel(FileID, Terms, Model%NClasses, Model%Grid)
+CASE ("nn_ensemble")
+  CALL ReadNNModel(FileID, Model%NClasses, Model%NN)
 CASE DEFAULT
-  ERROR STOP "MOD_CoverageKernel_IO: unknown /scheme (expected 'pooled' or 'grid')"
+  WRITE(*,*) "MOD_CoverageKernel_IO: ", TRIM(FileName), " has scheme '", TRIM(Model%Scheme), "'"
+  ERROR STOP "MOD_CoverageKernel_IO: unknown /scheme (expected 'grid' or 'nn_ensemble')"
 END SELECT
 
 CALL h5fclose_f(FileID, hdferr)
-CALL h5close_f(hdferr)
+CALL Chk(hdferr, "close file", FileName)
 END SUBROUTINE ReadCoverageModelHDF5
 
 !==================================================================================================================================
-!> Strip a fixed-width HDF5 string buffer at its first NUL byte (HDF5
-!> null-pads fixed-length strings shorter than the declared width) and
-!> trim trailing spaces.
+!> Stop with a message if an HDF5 call failed (HDF5 Fortran returns a
+!> negative hdferr on failure).
+!==================================================================================================================================
+SUBROUTINE Chk(hdferr, What, Name)
+INTEGER,          INTENT(IN) :: hdferr
+CHARACTER(LEN=*), INTENT(IN) :: What, Name
+IF (hdferr < 0) THEN
+  WRITE(*,*) "MOD_CoverageKernel_IO: HDF5 call failed: ", TRIM(What), " ", TRIM(Name)
+  ERROR STOP "MOD_CoverageKernel_IO: model file does not match the schema (see message above)"
+END IF
+END SUBROUTINE Chk
+
+!==================================================================================================================================
+!> Strip a fixed-width HDF5 string at its first NUL byte.
 !==================================================================================================================================
 PURE FUNCTION CStrClean(S) RESULT(Out)
-! INPUT / OUTPUT VARIABLES
 CHARACTER(LEN=*), INTENT(IN) :: S
 CHARACTER(LEN=LEN(S)) :: Out
-! LOCAL VARIABLES
 INTEGER :: p
-!----------------------------------------------------------------------------------------------------------------------------
 p = INDEX(S, ACHAR(0))
 IF (p > 0) THEN
   Out = S(1:p-1)
@@ -124,20 +136,35 @@ END IF
 END FUNCTION CStrClean
 
 !==================================================================================================================================
-!> Format an integer as a plain decimal string with no leading blanks --
-!> used to build HDF5 child-group/dataset names like "term_knots/3" or
-!> "ceiling_axes/0" that export_hdf5.py names after a 0-based Python index.
+!> Integer as a decimal string without blanks (names like "term_knots/3",
+!> "member_0", "layer_2" follow 0-based Python indices).
 !==================================================================================================================================
 PURE FUNCTION IntToStr(N) RESULT(S)
-! INPUT / OUTPUT VARIABLES
 INTEGER, INTENT(IN) :: N
 CHARACTER(LEN=:), ALLOCATABLE :: S
-! LOCAL VARIABLES
 CHARACTER(LEN=16) :: Buf
-!----------------------------------------------------------------------------------------------------------------------------
 WRITE(Buf, '(I0)') N
 S = TRIM(Buf)
 END FUNCTION IntToStr
+
+!==================================================================================================================================
+!> Open a child group, stopping with its name if it does not exist.
+!==================================================================================================================================
+SUBROUTINE OpenGroup(LocID, Name, GroupID)
+INTEGER(HID_T),   INTENT(IN)  :: LocID
+CHARACTER(LEN=*), INTENT(IN)  :: Name
+INTEGER(HID_T),   INTENT(OUT) :: GroupID
+INTEGER :: hdferr
+CALL h5gopen_f(LocID, TRIM(Name), GroupID, hdferr)
+CALL Chk(hdferr, "open group", Name)
+END SUBROUTINE OpenGroup
+
+SUBROUTINE CloseGroup(GroupID)
+INTEGER(HID_T), INTENT(IN) :: GroupID
+INTEGER :: hdferr
+CALL h5gclose_f(GroupID, hdferr)
+CALL Chk(hdferr, "close group", "")
+END SUBROUTINE CloseGroup
 
 !==================================================================================================================================
 !> HDF5 accessor helpers: scalar int/real/string attributes, attribute
@@ -149,6 +176,7 @@ CHARACTER(LEN=*), INTENT(IN) :: Name
 LOGICAL :: Exists
 INTEGER :: hdferr
 CALL h5aexists_f(LocID, TRIM(Name), Exists, hdferr)
+CALL Chk(hdferr, "check attribute", Name)
 END FUNCTION H5AttrExists
 
 FUNCTION H5ReadIntAttr(LocID, Name) RESULT(Val)
@@ -160,7 +188,9 @@ INTEGER(HSIZE_T) :: Dims(1)
 INTEGER :: hdferr
 Dims(1) = 1
 CALL h5aopen_f(LocID, TRIM(Name), AttrID, hdferr)
+CALL Chk(hdferr, "open attribute", Name)
 CALL h5aread_f(AttrID, H5T_NATIVE_INTEGER, Val, Dims, hdferr)
+CALL Chk(hdferr, "read attribute", Name)
 CALL h5aclose_f(AttrID, hdferr)
 END FUNCTION H5ReadIntAttr
 
@@ -173,7 +203,9 @@ INTEGER(HSIZE_T) :: Dims(1)
 INTEGER :: hdferr
 Dims(1) = 1
 CALL h5aopen_f(LocID, TRIM(Name), AttrID, hdferr)
+CALL Chk(hdferr, "open attribute", Name)
 CALL h5aread_f(AttrID, H5T_NATIVE_DOUBLE, Val, Dims, hdferr)
+CALL Chk(hdferr, "read attribute", Name)
 CALL h5aclose_f(AttrID, hdferr)
 END FUNCTION H5ReadRealAttr
 
@@ -189,7 +221,9 @@ Str = ' '
 CALL h5tcopy_f(H5T_FORTRAN_S1, StrType, hdferr)
 CALL h5tset_size_f(StrType, INT(NAME_LEN, SIZE_T), hdferr)
 CALL h5aopen_f(LocID, TRIM(Name), AttrID, hdferr)
+CALL Chk(hdferr, "open attribute", Name)
 CALL h5aread_f(AttrID, StrType, Str, Dims, hdferr)
+CALL Chk(hdferr, "read attribute", Name)
 CALL h5aclose_f(AttrID, hdferr)
 CALL h5tclose_f(StrType, hdferr)
 Str = CStrClean(Str)
@@ -203,10 +237,13 @@ INTEGER(HID_T) :: DsetID, SpaceID
 INTEGER :: hdferr, Rank
 INTEGER(HSIZE_T), ALLOCATABLE :: HDims(:), HMaxDims(:)
 CALL h5dopen_f(LocID, TRIM(Name), DsetID, hdferr)
+CALL Chk(hdferr, "open dataset", Name)
 CALL h5dget_space_f(DsetID, SpaceID, hdferr)
 CALL h5sget_simple_extent_ndims_f(SpaceID, Rank, hdferr)
+CALL Chk(hdferr, "get rank of dataset", Name)
 ALLOCATE(HDims(Rank), HMaxDims(Rank))
 CALL h5sget_simple_extent_dims_f(SpaceID, HDims, HMaxDims, hdferr)
+CALL Chk(hdferr, "get dimensions of dataset", Name)
 N = INT(PRODUCT(HDims))
 CALL h5sclose_f(SpaceID, hdferr)
 CALL h5dclose_f(DsetID, hdferr)
@@ -223,7 +260,9 @@ N = H5DatasetTotalSize(LocID, Name)
 ALLOCATE(Buf(N))
 Dims(1) = N
 CALL h5dopen_f(LocID, TRIM(Name), DsetID, hdferr)
+CALL Chk(hdferr, "open dataset", Name)
 CALL h5dread_f(DsetID, H5T_NATIVE_DOUBLE, Buf, Dims, hdferr)
+CALL Chk(hdferr, "read dataset", Name)
 CALL h5dclose_f(DsetID, hdferr)
 END FUNCTION H5ReadRealFlat
 
@@ -238,7 +277,9 @@ N = H5DatasetTotalSize(LocID, Name)
 ALLOCATE(Buf(N))
 Dims(1) = N
 CALL h5dopen_f(LocID, TRIM(Name), DsetID, hdferr)
+CALL Chk(hdferr, "open dataset", Name)
 CALL h5dread_f(DsetID, H5T_NATIVE_INTEGER, Buf, Dims, hdferr)
+CALL Chk(hdferr, "read dataset", Name)
 CALL h5dclose_f(DsetID, hdferr)
 END FUNCTION H5ReadIntFlat
 
@@ -255,7 +296,9 @@ Dims(1) = N
 CALL h5tcopy_f(H5T_FORTRAN_S1, StrType, hdferr)
 CALL h5tset_size_f(StrType, INT(NAME_LEN, SIZE_T), hdferr)
 CALL h5dopen_f(LocID, TRIM(Name), DsetID, hdferr)
+CALL Chk(hdferr, "open dataset", Name)
 CALL h5dread_f(DsetID, StrType, Buf, Dims, hdferr)
+CALL Chk(hdferr, "read dataset", Name)
 CALL h5dclose_f(DsetID, hdferr)
 CALL h5tclose_f(StrType, hdferr)
 DO i = 1, N
@@ -263,24 +306,20 @@ DO i = 1, N
 END DO
 END FUNCTION H5ReadStrArray
 
-!> Number of immediate child members of a group (used where the schema
-!> doesn't store an explicit count, e.g. /pooled/ceiling_axes -- the
-!> number of conditioning dimensions is just "however many subgroups are
-!> there", mirroring the Python loader's len(ceiling_axes_group)).
+!> Number of immediate child members of a group (the number of ceiling axes
+!> is the number of subgroups, as in the Python loader).
 FUNCTION H5NumGroupMembers(GroupID) RESULT(NMembers)
 INTEGER(HID_T), INTENT(IN) :: GroupID
 INTEGER :: NMembers
 INTEGER :: hdferr, StorageType, MaxCOrder
 CALL h5gget_info_f(GroupID, StorageType, NMembers, MaxCOrder, hdferr)
+CALL Chk(hdferr, "count group members", "")
 END FUNCTION H5NumGroupMembers
 
 !==================================================================================================================================
-!> Read the shared term spec (/terms in the schema): one t_Term per fitted
-!> term, NFeaturesOut computed from NKnots/Degree exactly as
-!> pooled_classifier.py's _n_term_features does. Per-term fitted Knots
-!> values are read later (they live under whichever of /pooled or
-!> /grid/cells actually holds the fitted classifier(s), since a spline
-!> term's knot *values* are fit data, not part of the shared spec).
+!> Read the shared term spec (/terms): one t_Term per fitted term,
+!> NFeaturesOut computed from NKnots/Degree as spline_classifier.py's
+!> _n_term_features does. Knot values are per cell (read in ReadGridModel).
 !==================================================================================================================================
 SUBROUTINE ReadTermSpec(GroupID, Terms)
 INTEGER(HID_T),            INTENT(IN)  :: GroupID
@@ -303,113 +342,108 @@ DO t = 1, NTerms
     Terms(t)%Degree = DegreeBuf(t)
     Terms(t)%NKnots = NKnotsBuf(t)
     Terms(t)%NFeaturesOut = Terms(t)%NKnots + Terms(t)%Degree - 2
-  ELSE
+  ELSE IF (TRIM(Terms(t)%Kind) == "linear") THEN
     Terms(t)%Degree       = -1
     Terms(t)%NKnots       = -1
     Terms(t)%NFeaturesOut = 1
+  ELSE
+    ERROR STOP "MOD_CoverageKernel_IO: unknown term kind (expected 'spline' or 'linear')"
   END IF
 END DO
 END SUBROUTINE ReadTermSpec
 
 !==================================================================================================================================
-!> Read one fitted t_PooledClassifier from GroupID (either /pooled itself,
-!> for the pooled scheme, or -- via ReadGridCells -- effectively inlined
-!> per grid cell for the grid scheme). SharedTerms carries the Kind/
-!> Column/Degree/NKnots/NFeaturesOut fields already read by ReadTermSpec;
-!> only the per-fit Knots values, present-class bookkeeping, and
-!> coefficients are read here.
+!> Read a ceiling grid (ceiling_axes/<d>/values + ceiling_grid) below GroupID.
+!> The ceiling is always interpolated multilinearly and clipped to its axes.
 !==================================================================================================================================
-FUNCTION ReadSinglePooledClassifier(GroupID, SharedTerms, NClasses) RESULT(Clf)
-INTEGER(HID_T),   INTENT(IN) :: GroupID
-TYPE(t_Term),     INTENT(IN) :: SharedTerms(:)
-INTEGER,          INTENT(IN) :: NClasses
-TYPE(t_PooledClassifier) :: Clf
-INTEGER :: NFeatures, NPresent, t, t0, p
-INTEGER(HID_T) :: TermKnotsGroupID
-INTEGER :: hdferr
-INTEGER,  ALLOCATABLE :: PresentBuf(:)
-REAL(wp), ALLOCATABLE :: CoefFlat(:), InterceptBuf(:)
+SUBROUTINE ReadCeilingGrid(GroupID, Axes, Shape_, Grid)
+INTEGER(HID_T),                 INTENT(IN)  :: GroupID
+TYPE(t_GridAxis), ALLOCATABLE,  INTENT(OUT) :: Axes(:)
+INTEGER, ALLOCATABLE,           INTENT(OUT) :: Shape_(:)
+REAL(wp), ALLOCATABLE,          INTENT(OUT) :: Grid(:)
+INTEGER(HID_T) :: CeilAxesGroupID, SubGroupID
+INTEGER :: d, NAxes
 !----------------------------------------------------------------------------------------------------------------------------
-NFeatures = SUM(SharedTerms(:)%NFeaturesOut)
+CALL OpenGroup(GroupID, "ceiling_axes", CeilAxesGroupID)
+NAxes = H5NumGroupMembers(CeilAxesGroupID)
+ALLOCATE(Axes(NAxes), Shape_(NAxes))
+DO d = 1, NAxes
+  CALL OpenGroup(CeilAxesGroupID, IntToStr(d - 1), SubGroupID)
+  Axes(d)%Values     = H5ReadRealFlat(SubGroupID, "values")
+  Axes(d)%EdgePolicy = "clip"
+  Shape_(d)          = SIZE(Axes(d)%Values)
+  CALL CloseGroup(SubGroupID)
+END DO
+CALL CloseGroup(CeilAxesGroupID)
+Grid = H5ReadRealFlat(GroupID, "ceiling_grid")
+IF (SIZE(Grid) /= PRODUCT(Shape_)) ERROR STOP "MOD_CoverageKernel_IO: ceiling_grid size does not match its axes"
+END SUBROUTINE ReadCeilingGrid
 
-Clf%NTerms    = SIZE(SharedTerms)
-Clf%NFeatures = NFeatures
-Clf%NClasses  = NClasses
-ALLOCATE(Clf%Terms(SIZE(SharedTerms)))
-Clf%Terms = SharedTerms
+!==================================================================================================================================
+!> Read the "nn_ensemble" scheme (/nn): every member network with its input
+!> standardization, the offset class, and the ceiling grid. Mirrors
+!> export_hdf5.py's load_nn_model. Weights are stored (n_in, n_out) in
+!> C-order; that flat buffer reshaped to the Fortran shape (NOut, NIn) gives
+!> W(j, i) = weights[i][j], so Y = MATMUL(W, X) + B.
+!==================================================================================================================================
+SUBROUTINE ReadNNModel(FileID, NClasses, NN)
+INTEGER(HID_T),  INTENT(IN)  :: FileID
+INTEGER,         INTENT(IN)  :: NClasses
+TYPE(t_NNModel), INTENT(OUT) :: NN
+INTEGER(HID_T) :: GroupID, MemberID, LayerID
+INTEGER :: m, l, NIn, NOut
+REAL(wp), ALLOCATABLE :: WFlat(:)
+!----------------------------------------------------------------------------------------------------------------------------
+CALL OpenGroup(FileID, "nn", GroupID)
+IF (TRIM(H5ReadStrAttr(GroupID, "combination")) /= "mean") &
+  ERROR STOP "MOD_CoverageKernel_IO: /nn/combination must be 'mean'"
+NN%NMembers    = H5ReadIntAttr(GroupID, "n_members")
+NN%CoverageMax = H5ReadRealAttr(GroupID, "coverage_max")
+NN%OffsetClass = H5ReadIntAttr(GroupID, "offset_class") + 1
+NN%OffsetFloor = H5ReadRealAttr(GroupID, "offset_floor")
+NN%HasCeiling  = H5ReadIntAttr(GroupID, "has_ceiling") /= 0
+ALLOCATE(NN%Members(NN%NMembers))
 
-Clf%ScalerMean  = H5ReadRealFlat(GroupID, "scaler_mean")
-Clf%ScalerScale = H5ReadRealFlat(GroupID, "scaler_scale")
-
-NPresent = H5ReadIntAttr(GroupID, "n_present_classes")
-Clf%NPresentClasses = NPresent
-PresentBuf = H5ReadIntFlat(GroupID, "present_classes")
-ALLOCATE(Clf%PresentClasses(NPresent))
-Clf%PresentClasses = PresentBuf(1:NPresent) + 1   ! 0-based -> 1-based
-
-CoefFlat     = H5ReadRealFlat(GroupID, "coef")        ! (NClasses, NFeatures), C-order; first NPresent rows valid
-InterceptBuf = H5ReadRealFlat(GroupID, "intercept")   ! (NClasses,)
-
-ALLOCATE(Clf%Coef(NPresent, NFeatures), Clf%Intercept(NPresent))
-DO p = 1, NPresent
-  Clf%Coef(p, :)  = CoefFlat((p - 1) * NFeatures + 1 : p * NFeatures)
-  Clf%Intercept(p) = InterceptBuf(p)
+DO m = 1, NN%NMembers
+  CALL OpenGroup(GroupID, "member_" // IntToStr(m - 1), MemberID)
+  ASSOCIATE(Net => NN%Members(m))
+    Net%InputMean = H5ReadRealFlat(MemberID, "input_mean")
+    Net%InputStd  = H5ReadRealFlat(MemberID, "input_std")
+    Net%NLayers   = H5ReadIntAttr(MemberID, "n_layers")
+    ALLOCATE(Net%Layers(Net%NLayers))
+    NIn = SIZE(Net%InputMean) + 1          ! conditioning inputs + coverage fraction
+    DO l = 1, Net%NLayers
+      CALL OpenGroup(MemberID, "layer_" // IntToStr(l - 1), LayerID)
+      Net%Layers(l)%Activation = H5ReadStrAttr(LayerID, "activation")
+      IF (.NOT. IsKnownActivation(Net%Layers(l)%Activation)) &
+        ERROR STOP "MOD_CoverageKernel_IO: unknown activation in /nn (expected silu, tanh, relu or linear)"
+      Net%Layers(l)%B = H5ReadRealFlat(LayerID, "biases")
+      WFlat = H5ReadRealFlat(LayerID, "weights")
+      NOut = SIZE(Net%Layers(l)%B)
+      IF (SIZE(WFlat) /= NIn * NOut) ERROR STOP "MOD_CoverageKernel_IO: /nn layer weights do not match the layer widths"
+      Net%Layers(l)%NIn  = NIn
+      Net%Layers(l)%NOut = NOut
+      Net%Layers(l)%W = RESHAPE(WFlat, [NOut, NIn])
+      CALL CloseGroup(LayerID)
+      NIn = NOut
+    END DO
+    IF (NIn /= NClasses) ERROR STOP "MOD_CoverageKernel_IO: last /nn layer width /= n_classes"
+  END ASSOCIATE
+  CALL CloseGroup(MemberID)
 END DO
 
-CALL h5gopen_f(GroupID, "term_knots", TermKnotsGroupID, hdferr)
-DO t = 1, SIZE(SharedTerms)
-  IF (TRIM(SharedTerms(t)%Kind) == "spline") THEN
-    t0 = t - 1
-    Clf%Terms(t)%Knots = H5ReadRealFlat(TermKnotsGroupID, IntToStr(t0))
-  END IF
-END DO
-CALL h5gclose_f(TermKnotsGroupID, hdferr)
-END FUNCTION ReadSinglePooledClassifier
-
-!==================================================================================================================================
-!> Read the "pooled" scheme's whole domain model: the single fitted
-!> classifier plus its optional interpolated ceiling grid. Mirrors
-!> export_hdf5.py's load_pooled_model.
-!==================================================================================================================================
-SUBROUTINE ReadPooledModel(FileID, Terms, NClasses, Model)
-INTEGER(HID_T),        INTENT(IN)  :: FileID
-TYPE(t_Term),          INTENT(IN)  :: Terms(:)
-INTEGER,               INTENT(IN)  :: NClasses
-TYPE(t_PooledModel),   INTENT(OUT) :: Model
-INTEGER(HID_T) :: GroupID, CeilAxesGroupID, SubGroupID
-INTEGER :: hdferr, d, NCeilAxes
-!----------------------------------------------------------------------------------------------------------------------------
-CALL h5gopen_f(FileID, "pooled", GroupID, hdferr)
-
-Model%Classifier  = ReadSinglePooledClassifier(GroupID, Terms, NClasses)
-Model%CoverageMax = H5ReadRealAttr(GroupID, "coverage_max")
-Model%HasCeiling  = H5ReadIntAttr(GroupID, "has_ceiling") /= 0
-
-IF (Model%HasCeiling) THEN
-  CALL h5gopen_f(GroupID, "ceiling_axes", CeilAxesGroupID, hdferr)
-  NCeilAxes = H5NumGroupMembers(CeilAxesGroupID)
-  Model%NCeilingAxes = NCeilAxes
-  ALLOCATE(Model%CeilingAxes(NCeilAxes), Model%CeilingShape(NCeilAxes))
-  DO d = 1, NCeilAxes
-    CALL h5gopen_f(CeilAxesGroupID, IntToStr(d - 1), SubGroupID, hdferr)
-    Model%CeilingAxes(d)%Values     = H5ReadRealFlat(SubGroupID, "values")
-    Model%CeilingAxes(d)%EdgePolicy = "clip"   ! ceiling interpolation always clips (see MultilinearClipped)
-    Model%CeilingShape(d)           = SIZE(Model%CeilingAxes(d)%Values)
-    CALL h5gclose_f(SubGroupID, hdferr)
-  END DO
-  CALL h5gclose_f(CeilAxesGroupID, hdferr)
-  Model%CeilingGrid = H5ReadRealFlat(GroupID, "ceiling_grid")
+IF (NN%HasCeiling) THEN
+  CALL ReadCeilingGrid(GroupID, NN%CeilingAxes, NN%CeilingShape, NN%CeilingGrid)
+  NN%NCeilingAxes = SIZE(NN%CeilingAxes)
 ELSE
-  Model%NCeilingAxes = 0
+  NN%NCeilingAxes = 0
 END IF
-
-CALL h5gclose_f(GroupID, hdferr)
-END SUBROUTINE ReadPooledModel
+CALL CloseGroup(GroupID)
+END SUBROUTINE ReadNNModel
 
 !==================================================================================================================================
-!> Read the "grid" scheme's whole domain model: the axes (with per-axis
-!> edge policy) and every already-blended cell, flattened C-order.
-!> Mirrors export_hdf5.py's load_grid_model.
+!> Read the "grid" scheme (/grid): the axes (with per-axis edge policy) and
+!> every cell, flattened C-order. Mirrors export_hdf5.py's load_grid_model.
 !==================================================================================================================================
 SUBROUTINE ReadGridModel(FileID, Terms, NClasses, Model)
 INTEGER(HID_T),    INTENT(IN)  :: FileID
@@ -417,7 +451,7 @@ TYPE(t_Term),      INTENT(IN)  :: Terms(:)
 INTEGER,           INTENT(IN)  :: NClasses
 TYPE(t_GridModel), INTENT(OUT) :: Model
 INTEGER(HID_T) :: GroupID, AxesGroupID, SubGroupID, CellsGroupID, TermKnotsGroupID
-INTEGER :: hdferr, d, NAxes, NFeatures, NCells, c, t, t0, p
+INTEGER :: d, NAxes, NFeatures, NCells, c, t, p
 INTEGER :: NPresentC, BaseFeat, BasePres, BaseCoef, BaseInt, BaseKnot, KnotLen
 REAL(wp) :: CeilVal
 REAL(wp), ALLOCATABLE :: CoverageMaxFlat(:), CeilingFlat(:), ScalerMeanFlat(:), ScalerScaleFlat(:)
@@ -425,27 +459,27 @@ REAL(wp), ALLOCATABLE :: CoefFlat(:), InterceptFlat(:)
 INTEGER,  ALLOCATABLE :: NPresentFlat(:), PresentFlat(:)
 TYPE(t_FlatBuf), ALLOCATABLE :: TermKnotFlats(:)
 !----------------------------------------------------------------------------------------------------------------------------
-CALL h5gopen_f(FileID, "grid", GroupID, hdferr)
+CALL OpenGroup(FileID, "grid", GroupID)
 
 NAxes = H5ReadIntAttr(GroupID, "n_axes")
 Model%NAxes = NAxes
 Model%InterpMethod = H5ReadStrAttr(GroupID, "interp_method")
 ALLOCATE(Model%Axes(NAxes), Model%Shape(NAxes))
 
-CALL h5gopen_f(GroupID, "axes", AxesGroupID, hdferr)
+CALL OpenGroup(GroupID, "axes", AxesGroupID)
 DO d = 1, NAxes
-  CALL h5gopen_f(AxesGroupID, IntToStr(d - 1), SubGroupID, hdferr)
+  CALL OpenGroup(AxesGroupID, IntToStr(d - 1), SubGroupID)
   Model%Axes(d)%Values     = H5ReadRealFlat(SubGroupID, "values")
   Model%Axes(d)%EdgePolicy = H5ReadStrAttr(SubGroupID, "edge_policy")
   Model%Shape(d)           = SIZE(Model%Axes(d)%Values)
-  CALL h5gclose_f(SubGroupID, hdferr)
+  CALL CloseGroup(SubGroupID)
 END DO
-CALL h5gclose_f(AxesGroupID, hdferr)
+CALL CloseGroup(AxesGroupID)
 
 NFeatures = SUM(Terms(:)%NFeaturesOut)
 NCells = PRODUCT(Model%Shape)
 
-CALL h5gopen_f(GroupID, "cells", CellsGroupID, hdferr)
+CALL OpenGroup(GroupID, "cells", CellsGroupID)
 CoverageMaxFlat = H5ReadRealFlat(CellsGroupID, "coverage_max")
 CeilingFlat     = H5ReadRealFlat(CellsGroupID, "ceiling")
 ScalerMeanFlat  = H5ReadRealFlat(CellsGroupID, "scaler_mean")
@@ -454,15 +488,16 @@ NPresentFlat    = H5ReadIntFlat(CellsGroupID, "n_present_classes")
 PresentFlat     = H5ReadIntFlat(CellsGroupID, "present_classes")
 CoefFlat        = H5ReadRealFlat(CellsGroupID, "coef")
 InterceptFlat   = H5ReadRealFlat(CellsGroupID, "intercept")
+IF (SIZE(CoverageMaxFlat) /= NCells .OR. SIZE(CoefFlat) /= NCells * NClasses * NFeatures) &
+  ERROR STOP "MOD_CoverageKernel_IO: /grid/cells sizes do not match the axes and terms"
 
 ALLOCATE(Model%Cells(NCells))
 
-CALL h5gopen_f(CellsGroupID, "term_knots", TermKnotsGroupID, hdferr)
+CALL OpenGroup(CellsGroupID, "term_knots", TermKnotsGroupID)
 ALLOCATE(TermKnotFlats(SIZE(Terms)))
 DO t = 1, SIZE(Terms)
   IF (TRIM(Terms(t)%Kind) == "spline") THEN
-    t0 = t - 1
-    TermKnotFlats(t)%Data = H5ReadRealFlat(TermKnotsGroupID, IntToStr(t0))
+    TermKnotFlats(t)%Data = H5ReadRealFlat(TermKnotsGroupID, IntToStr(t - 1))
   END IF
 END DO
 
@@ -507,9 +542,9 @@ DO c = 1, NCells
   END ASSOCIATE
 END DO
 
-CALL h5gclose_f(TermKnotsGroupID, hdferr)
-CALL h5gclose_f(CellsGroupID, hdferr)
-CALL h5gclose_f(GroupID, hdferr)
+CALL CloseGroup(TermKnotsGroupID)
+CALL CloseGroup(CellsGroupID)
+CALL CloseGroup(GroupID)
 END SUBROUTINE ReadGridModel
 
 END MODULE MOD_CoverageKernel_IO

@@ -1,111 +1,121 @@
 !==================================================================================================================================
-!> Example integration program: loads the pooled and grid models exported
-!> by examples/python/export_models_to_hdf5.py and computes the same
-!> coverage-vs-(velocity,angle) heatmap examples/python/monte_carlo_walk.ipynb
-!> does, but entirely from Fortran through MOD_CoverageKernel's public API --
-!> this is meant to read like a worked example of what a DSMC boundary
-!> condition's own per-particle loop looks like: own RNG stream (here,
-!> Fortran's intrinsic RANDOM_NUMBER; a real host code would use its own),
-!> own coverage state per surface element, calling SampleCoverageOutcome
-!> once per step.
+!> Worked integration example: the coverage walk a DSMC boundary condition
+!> runs, through MOD_CoverageKernel's public API only.
 !>
-!> Sweep (matches monte_carlo_walk.ipynb exactly): angles 0-80 deg in 10 deg
-!> steps, velocities 1000-11000 m/s in 1000 m/s steps -- deliberately wider
-!> than the sampled training grid (8 velocities x 5 angles, 2000-9319 m/s),
-!> to also exercise the grid scheme's velocity extrapolation and the pooled
-!> scheme's ceiling-grid interpolation outside their trusted range.
+!> Loads the paper's coverage-weighted NN ensemble and grid model and, for
+!> the same velocity/angle sweep as examples/python/coverage_walk.py,
+!> computes
+!>   - the exact long-run coverage average (stationary distribution of the
+!>     walk on the integer coverages 0..NSites: pi(c+1)/pi(c) = P_up(c)/P_down(c+1)),
+!>   - the average of a Monte Carlo walk: one SampleCoverageOutcome call per
+!>     impact with the host's own random numbers (here RANDOM_NUMBER),
+!> and writes walk_sweep_fortran.csv. `python ../python/coverage_walk.py
+!> --compare` checks it against the Python results.
 !>
-!> For each (velocity, angle), runs a 20000-step random walk from
-!> coverage=0 (coverage clipped at 0, matching the physical floor) and
-!> reports the mean coverage over the last 8000 steps as that condition's
-!> equilibrium estimate -- same N_STEPS/N_TAIL convention as the Python
-!> notebook, though not a bit-for-bit RNG match (Fortran's own
-!> RANDOM_NUMBER stream, not NumPy's).
+!> The host owns the random-number stream and the coverage state of every
+!> surface element; the model is read-only after loading.
+!>
+!> Run from examples/fortran/:   ./build/monte_carlo_walk [nn_file grid_file]
 !==================================================================================================================================
 PROGRAM monte_carlo_walk
 ! MODULES
 USE MOD_CoverageKernel
-USE, INTRINSIC :: ISO_FORTRAN_ENV, ONLY: REAL64
 IMPLICIT NONE
 !----------------------------------------------------------------------------------------------------------------------------
-INTEGER, PARAMETER :: NAngles = 9                    !> 0, 10, ..., 80 deg
-INTEGER, PARAMETER :: NVelocities = 11                !> 1000, 2000, ..., 11000 m/s
-INTEGER, PARAMETER :: NSteps = 20000
-INTEGER, PARAMETER :: NTail = 8000
-
-REAL(wp) :: Angles(NAngles), Velocities(NVelocities)
-TYPE(t_CoverageModel) :: PooledModel, GridModel
-INTEGER :: i, SeedSize
+INTEGER,  PARAMETER :: NSteps = 20000, NTail = 8000
+REAL(wp), PARAMETER :: Velocities(3) = [5000.0_wp, 7923.9_wp, 9319.0_wp]
+REAL(wp), PARAMETER :: Angles(9) = [0.0_wp, 10.0_wp, 20.0_wp, 30.0_wp, 40.0_wp, 50.0_wp, 60.0_wp, 70.0_wp, 80.0_wp]
+CHARACTER(LEN=256) :: Files(2)
+CHARACTER(LEN=16), PARAMETER :: Names(2) = ["nn_ensemble     ", "grid            "]
+TYPE(t_CoverageModel) :: Model
+INTEGER :: m, iv, ia, Unit, SeedSize
 INTEGER, ALLOCATABLE :: Seed(:)
+REAL(wp) :: Stationary, WalkAvg
 !==================================================================================================================================
-! Fixed seed for a reproducible example run (not a bit-for-bit match to
-! monte_carlo_walk.ipynb's NumPy RNG -- just the same "seed=0" spirit).
+Files(1) = "../data/models/branching_nn_ensemble_weighted.h5"
+Files(2) = "../data/models/grid_model.h5"
+IF (COMMAND_ARGUMENT_COUNT() == 2) THEN
+  CALL GET_COMMAND_ARGUMENT(1, Files(1))
+  CALL GET_COMMAND_ARGUMENT(2, Files(2))
+END IF
+
 CALL RANDOM_SEED(SIZE=SeedSize)
 ALLOCATE(Seed(SeedSize))
-Seed = 0
+Seed = 12345
 CALL RANDOM_SEED(PUT=Seed)
 
-DO i = 1, NAngles
-  Angles(i) = REAL((i - 1) * 10, wp)
+OPEN(NEWUNIT=Unit, FILE="walk_sweep_fortran.csv", STATUS="REPLACE", ACTION="WRITE")
+WRITE(Unit, '(A)') "model,velocity,angle,stationary_average,walk_average"
+DO m = 1, 2
+  CALL LoadCoverageModel(TRIM(Files(m)), Model)
+  DO iv = 1, SIZE(Velocities)
+    DO ia = 1, SIZE(Angles)
+      Stationary = StationaryAverage(Model, Velocities(iv), Angles(ia))
+      WalkAvg = WalkAverage(Model, Velocities(iv), Angles(ia))
+      WRITE(Unit, '(A,",",F0.1,",",F0.1,",",ES23.16,",",ES23.16)') TRIM(Names(m)), Velocities(iv), Angles(ia), &
+            Stationary, WalkAvg
+    END DO
+  END DO
+  WRITE(*, '(3A)') "done: ", TRIM(Names(m)), " model"
 END DO
-DO i = 1, NVelocities
-  Velocities(i) = REAL(1000 * i, wp)
-END DO
-
-CALL LoadCoverageModel("../python/models/pooled_model.h5", PooledModel)
-CALL LoadCoverageModel("../python/models/grid_model.h5", GridModel)
-
-CALL RunSweep("heatmap_pooled.csv", PooledModel, Velocities, Angles)
-CALL RunSweep("heatmap_grid.csv", GridModel, Velocities, Angles)
-
-WRITE(*, *) "Wrote heatmap_pooled.csv and heatmap_grid.csv"
+CLOSE(Unit)
+WRITE(*, '(A)') "wrote walk_sweep_fortran.csv"
 
 CONTAINS
 
-!==================================================================================================================================
-!> Run the full (velocity, angle) sweep for one loaded model and write
-!> "velocity,angle,mean_coverage" rows to FileName.
-!==================================================================================================================================
-SUBROUTINE RunSweep(FileName, Model, Velocities, Angles)
-CHARACTER(LEN=*),      INTENT(IN) :: FileName
+!> Index of the class with coverage change Delta (+1 or -1).
+INTEGER FUNCTION ClassWithDelta(Model, Delta)
 TYPE(t_CoverageModel), INTENT(IN) :: Model
-REAL(wp),              INTENT(IN) :: Velocities(:), Angles(:)
-INTEGER :: Unit, vi, ai
-REAL(wp) :: MeanCoverage
-!----------------------------------------------------------------------------------------------------------------------------
-OPEN(NEWUNIT=Unit, FILE=FileName, STATUS="REPLACE", ACTION="WRITE")
-WRITE(Unit, '(A)') "velocity,angle,mean_coverage"
-DO vi = 1, SIZE(Velocities)
-  DO ai = 1, SIZE(Angles)
-    MeanCoverage = RunOneWalk(Model, Velocities(vi), Angles(ai))
-    WRITE(Unit, '(F10.2,A,F8.2,A,F12.6)') Velocities(vi), ",", Angles(ai), ",", MeanCoverage
-  END DO
+REAL(wp),              INTENT(IN) :: Delta
+INTEGER :: k
+ClassWithDelta = 0
+DO k = 1, Model%NClasses
+  IF (Model%CoverageDelta(k) == Delta) ClassWithDelta = k
 END DO
-CLOSE(Unit)
-END SUBROUTINE RunSweep
+IF (ClassWithDelta == 0) ERROR STOP "monte_carlo_walk: model needs one class with coverage change +1 and one with -1"
+END FUNCTION ClassWithDelta
 
-!==================================================================================================================================
-!> One condition's random walk: NSteps steps starting at coverage=0,
-!> coverage clipped at 0 after every step (the physical floor -- coverage
-!> can't go negative), returns the mean coverage over the last NTail steps.
-!==================================================================================================================================
-FUNCTION RunOneWalk(Model, Velocity, Angle) RESULT(MeanCoverage)
+!> Exact long-run mean coverage of the walk on the integer coverages 0..NSites.
+REAL(wp) FUNCTION StationaryAverage(Model, Velocity, Angle)
 TYPE(t_CoverageModel), INTENT(IN) :: Model
 REAL(wp),              INTENT(IN) :: Velocity, Angle
-REAL(wp) :: MeanCoverage
-REAL(wp) :: Coverage, Xi, DeltaCoverage, Probs(Model%NClasses)
-REAL(wp) :: TailSum
-INTEGER  :: Step, Outcome
-!----------------------------------------------------------------------------------------------------------------------------
+REAL(wp) :: P(Model%NClasses, 0:Model%NSites), LogPi(0:Model%NSites), Pi(0:Model%NSites)
+INTEGER :: c, Up, Down, Last
+Up = ClassWithDelta(Model, 1.0_wp)
+Down = ClassWithDelta(Model, -1.0_wp)
+DO c = 0, Model%NSites
+  CALL EvalCoverageProbs(Model, REAL(c, wp), Velocity, Angle, P(:, c))
+END DO
+LogPi = 0.0_wp
+Last = Model%NSites            ! highest coverage the walk can reach
+DO c = 0, Model%NSites - 1
+  IF (P(Up, c) <= 0.0_wp .OR. P(Down, c + 1) <= 0.0_wp) THEN
+    Last = c
+    EXIT
+  END IF
+  LogPi(c + 1) = LogPi(c) + LOG(P(Up, c)) - LOG(P(Down, c + 1))
+END DO
+Pi = 0.0_wp
+Pi(0:Last) = EXP(LogPi(0:Last) - MAXVAL(LogPi(0:Last)))
+Pi = Pi / SUM(Pi)
+StationaryAverage = SUM(Pi * [(REAL(c, wp), c = 0, Model%NSites)])
+END FUNCTION StationaryAverage
+
+!> Mean coverage over the last NTail of NSteps impacts, starting from coverage 0.
+REAL(wp) FUNCTION WalkAverage(Model, Velocity, Angle)
+TYPE(t_CoverageModel), INTENT(IN) :: Model
+REAL(wp),              INTENT(IN) :: Velocity, Angle
+REAL(wp) :: Coverage, Xi, Delta, Probs(Model%NClasses), Total
+INTEGER :: Step, Outcome
 Coverage = 0.0_wp
-TailSum = 0.0_wp
+Total = 0.0_wp
 DO Step = 1, NSteps
   CALL RANDOM_NUMBER(Xi)
-  CALL SampleCoverageOutcome(Model, Coverage, Angle, Velocity, Xi, Outcome, DeltaCoverage, Probs)
-  Coverage = MAX(Coverage + DeltaCoverage, 0.0_wp)
-  IF (Step > NSteps - NTail) TailSum = TailSum + Coverage
+  CALL SampleCoverageOutcome(Model, Coverage, Velocity, Angle, Xi, Outcome, Delta, Probs)
+  Coverage = MAX(0.0_wp, Coverage + Delta)
+  IF (Step > NSteps - NTail) Total = Total + Coverage
 END DO
-MeanCoverage = TailSum / REAL(NTail, wp)
-END FUNCTION RunOneWalk
+WalkAverage = Total / REAL(NTail, wp)
+END FUNCTION WalkAverage
 
 END PROGRAM monte_carlo_walk

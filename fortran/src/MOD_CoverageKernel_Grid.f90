@@ -24,16 +24,20 @@
 !==================================================================================================================================
 MODULE MOD_CoverageKernel_Grid
 ! MODULES
-USE MOD_CoverageKernel_Types,    ONLY: wp, t_GridAxis
+USE MOD_CoverageKernel_Types,    ONLY: wp, t_GridAxis, t_CoverageModel
 USE MOD_CoverageKernel_Interp1D, ONLY: LocalWindow, LinearEvalWindowVec, PchipEvalWindowVec, FlatIndexCOrder
 IMPLICIT NONE
 PRIVATE
 !----------------------------------------------------------------------------------------------------------------------------
 ABSTRACT INTERFACE
   !> Evaluate one grid cell's own (already blended, in the domain layer's
-  !> sense) probability vector at the given per-cell feature value.
-  FUNCTION CellEvalInterface(FlatIdx, Feature, NClasses) RESULT(Probs)
-    IMPORT :: wp
+  !> sense) probability vector at the given per-cell feature value. Model is
+  !> passed through untouched as the caller's context, so the callback can be
+  !> a plain module procedure (an internal procedure passed as an argument
+  !> would need an executable-stack trampoline, which host codes may refuse).
+  FUNCTION CellEvalInterface(Model, FlatIdx, Feature, NClasses) RESULT(Probs)
+    IMPORT :: wp, t_CoverageModel
+    TYPE(t_CoverageModel), INTENT(IN) :: Model
     INTEGER,  INTENT(IN) :: FlatIdx, NClasses
     REAL(wp), INTENT(IN) :: Feature
     REAL(wp) :: Probs(NClasses)
@@ -54,8 +58,9 @@ CONTAINS
 !> convex-combination method like "linear" does, though pchip was chosen
 !> for empirically negligible overshoot -- see grid_classifier.py).
 !==================================================================================================================================
-FUNCTION EvalGridModel(Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses) RESULT(Probs)
+FUNCTION EvalGridModel(Model, Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses) RESULT(Probs)
 ! INPUT / OUTPUT VARIABLES
+TYPE(t_CoverageModel), INTENT(IN) :: Model
 TYPE(t_GridAxis), INTENT(IN) :: Axes(:)
 INTEGER,          INTENT(IN) :: Shape_(:)
 CHARACTER(LEN=*), INTENT(IN) :: Method
@@ -68,7 +73,7 @@ REAL(wp) :: Probs(NClasses)
 REAL(wp) :: RawTotal
 INTEGER  :: EmptyIdx(0)
 !----------------------------------------------------------------------------------------------------------------------------
-Probs = EvalGridRecursive(Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, 1, EmptyIdx)
+Probs = EvalGridRecursive(Model, Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, 1, EmptyIdx)
 Probs = MAX(Probs, 0.0_wp)
 RawTotal = SUM(Probs)
 IF (RawTotal > 0.0_wp) Probs = Probs / RawTotal
@@ -81,9 +86,10 @@ END FUNCTION EvalGridModel
 !> recurse for every window index, and interpolate the results along this
 !> axis.
 !==================================================================================================================================
-RECURSIVE FUNCTION EvalGridRecursive(Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, Depth, FixedIdx) &
-    RESULT(Probs)
+RECURSIVE FUNCTION EvalGridRecursive(Model, Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, Depth, &
+                                     FixedIdx) RESULT(Probs)
 ! INPUT / OUTPUT VARIABLES
+TYPE(t_CoverageModel), INTENT(IN) :: Model
 TYPE(t_GridAxis), INTENT(IN) :: Axes(:)
 INTEGER,          INTENT(IN) :: Shape_(:)
 CHARACTER(LEN=*), INTENT(IN) :: Method
@@ -105,7 +111,7 @@ LOGICAL :: IsLeftEdge, IsRightEdge
 NAxes = SIZE(Shape_)
 IF (Depth > NAxes) THEN
   FlatIdx = FlatIndexCOrder(Shape_, FixedIdx)
-  Probs = CellEval(FlatIdx, Feature, NClasses)
+  Probs = CellEval(Model, FlatIdx, Feature, NClasses)
   RETURN
 END IF
 
@@ -129,7 +135,8 @@ CASE DEFAULT
 END SELECT
 
 IF (SIZE(Grid1D) == 1) THEN
-  Probs = EvalGridRecursive(Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, Depth + 1, [FixedIdx, 1])
+  Probs = EvalGridRecursive(Model, Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, Depth + 1, &
+                            [FixedIdx, 1])
   RETURN
 END IF
 
@@ -137,7 +144,7 @@ CALL LocalWindow(Grid1D, Qv, TRIM(EffMethod), Lo, Hi)
 WindowSize = Hi - Lo + 1
 ALLOCATE(Values(WindowSize, NClasses))
 DO w = 1, WindowSize
-  Values(w, :) = EvalGridRecursive(Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, &
+  Values(w, :) = EvalGridRecursive(Model, Axes, Shape_, Method, Feature, AxisQuery, CellEval, NClasses, &
                                     Depth + 1, [FixedIdx, Lo + w - 1])
 END DO
 XWindow = Grid1D(Lo:Hi)

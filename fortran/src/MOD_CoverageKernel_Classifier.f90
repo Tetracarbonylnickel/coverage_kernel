@@ -1,26 +1,26 @@
 !==================================================================================================================================
-!> GENERIC: feature assembly from a t_PooledClassifier's Terms(:), plus
-!> present-classes-masked softmax evaluation. Mirrors pooled_classifier.py:
+!> GENERIC: feature assembly from a t_SplineClassifier's Terms(:), plus
+!> present-classes-masked softmax evaluation. Mirrors spline_classifier.py:
 !> this module has no idea what the raw feature columns *mean* (coverage,
 !> angle, velocity, ...) -- it just builds a standardized feature vector
 !> from named terms (B-spline expansion or passthrough) and evaluates a
 !> multinomial logistic classifier over it.
 !>
 !> Classes never observed at fit time are entirely absent from Coef/
-!> Intercept (see t_PooledClassifier's docstring in MOD_CoverageKernel_Types)
-!> -- EvalPooledClassifier reconstructs the full NClasses-length probability
+!> Intercept (see t_SplineClassifier's docstring in MOD_CoverageKernel_Types)
+!> -- EvalSplineClassifier reconstructs the full NClasses-length probability
 !> vector by softmaxing only over PresentClasses and scattering zeros
 !> elsewhere, never by reading Coef as if it were already dense.
 !==================================================================================================================================
 MODULE MOD_CoverageKernel_Classifier
 ! MODULES
-USE MOD_CoverageKernel_Types,   ONLY: wp, t_Term, t_PooledClassifier
+USE MOD_CoverageKernel_Types,   ONLY: wp, t_Term, t_SplineClassifier
 USE MOD_CoverageKernel_BSpline, ONLY: BasisVector
 IMPLICIT NONE
 PRIVATE
 !----------------------------------------------------------------------------------------------------------------------------
 PUBLIC :: BuildFeatureVector
-PUBLIC :: EvalPooledClassifier
+PUBLIC :: EvalSplineClassifier
 !==================================================================================================================================
 CONTAINS
 
@@ -28,7 +28,7 @@ CONTAINS
 !> Assemble the raw (pre-standardization) feature vector from XRaw(:) (the
 !> classifier's own input columns, 1-based) via its Terms(:): a SplineTerm
 !> expands one column into a B-spline basis block, a LinearTerm passes its
-!> column through unchanged. Mirrors pooled_classifier.py's
+!> column through unchanged. Mirrors spline_classifier.py's
 !> _term_columns_raw for a single row.
 !==================================================================================================================================
 FUNCTION BuildFeatureVector(Terms, XRaw, NFeatures) RESULT(Z)
@@ -62,9 +62,9 @@ END FUNCTION BuildFeatureVector
 !> into the full NClasses-length output (classes absent from the fit are
 !> exactly 0, not a small nonzero share -- see this module's docstring).
 !==================================================================================================================================
-FUNCTION EvalPooledClassifier(Clf, XRaw) RESULT(Probs)
+FUNCTION EvalSplineClassifier(Clf, XRaw) RESULT(Probs)
 ! INPUT / OUTPUT VARIABLES
-TYPE(t_PooledClassifier), INTENT(IN) :: Clf
+TYPE(t_SplineClassifier), INTENT(IN) :: Clf
 REAL(wp),                 INTENT(IN) :: XRaw(:)
 REAL(wp) :: Probs(Clf%NClasses)
 ! LOCAL VARIABLES
@@ -87,6 +87,6 @@ Probs = 0.0_wp
 DO p = 1, Clf%NPresentClasses
   Probs(Clf%PresentClasses(p)) = Logits(p) / ExpSum
 END DO
-END FUNCTION EvalPooledClassifier
+END FUNCTION EvalSplineClassifier
 
 END MODULE MOD_CoverageKernel_Classifier

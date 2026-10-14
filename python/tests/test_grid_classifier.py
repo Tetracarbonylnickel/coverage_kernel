@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.interpolate import RegularGridInterpolator
 
-from coverage_kernel import pooled_classifier as pc
+from coverage_kernel import spline_classifier as sc
 from coverage_kernel import grid_classifier as gc
 
 
@@ -12,7 +12,7 @@ def rng():
 
 
 def _make_synthetic_grid(rng, n_v=6, n_a=5, n_classes=3):
-    """Build a small synthetic grid of independently-fitted PooledClassifiers,
+    """Build a small synthetic grid of independently-fitted SplineClassifiers,
     one per cell, mirroring what fit_grid_classifier would produce."""
     velocities = np.linspace(2000, 9000, n_v)
     angles = np.linspace(0, 80, n_a)
@@ -25,8 +25,8 @@ def _make_synthetic_grid(rng, n_v=6, n_a=5, n_classes=3):
             p = np.exp(logits)
             p /= p.sum(axis=1, keepdims=True)
             y = np.array([rng.choice(n_classes, p=pp) for pp in p])
-            clf = pc.fit_pooled_classifier(coverage.reshape(-1, 1), y,
-                                            [pc.SplineTerm(0, n_knots=4, degree=2)], n_classes=n_classes)
+            clf = sc.fit_spline_classifier(coverage.reshape(-1, 1), y,
+                                            [sc.SplineTerm(0, n_knots=4, degree=2)], n_classes=n_classes)
             cell_classifiers[(vi, ai)] = clf
     return velocities, angles, cell_classifiers
 
@@ -107,7 +107,7 @@ def test_fit_grid_classifier_end_to_end(rng):
     labels = np.array([rng.choice(3, p=pi) for pi in p])
 
     model = gc.fit_grid_classifier([velocities, angles], event_axis_values, coverage, labels,
-                                    [pc.SplineTerm(0, n_knots=4, degree=2)], n_classes=3)
+                                    [sc.SplineTerm(0, n_knots=4, degree=2)], n_classes=3)
     probs = model.eval(np.array([5.0]), [4000.0, 30.0])
     assert probs.shape == (3,)
     assert np.all(probs >= 0)

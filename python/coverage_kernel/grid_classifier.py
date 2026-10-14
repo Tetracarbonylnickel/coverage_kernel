@@ -2,7 +2,7 @@
 grid_classifier.py
 ===================
 Generic building block: an N-dimensional grid of independent classifiers
-(one per grid cell, each a pooled_classifier.PooledClassifier) with local,
+(one per grid cell, each a spline_classifier.SplineClassifier) with local,
 lazy interpolation across the grid at query time.
 
 This has no idea what the grid axes or the per-cell feature mean -- it
@@ -42,7 +42,7 @@ import numpy as np
 from joblib import Parallel, delayed
 
 from . import interp1d
-from .pooled_classifier import fit_pooled_classifier
+from .spline_classifier import fit_spline_classifier
 
 
 def _nearest_indices(axes, event_axis_values):
@@ -82,7 +82,7 @@ class GridClassifier:
 
     def __init__(self, axes, cell_classifiers, n_classes, method="pchip"):
         self.axes = axes                        # list[AxisSpec]
-        self.cell_classifiers = cell_classifiers  # {index_tuple: PooledClassifier}
+        self.cell_classifiers = cell_classifiers  # {index_tuple: SplineClassifier}
         self.n_classes = n_classes
         self.method = method
 
@@ -139,7 +139,7 @@ class GridClassifier:
 
 def fit_grid_classifier(axes, event_axis_values, event_features, event_labels, terms, *,
                          n_classes, C=1.0, n_jobs=1, method="pchip"):
-    """Fit one independent PooledClassifier per grid cell.
+    """Fit one independent SplineClassifier per grid cell.
 
     Parameters
     ----------
@@ -154,11 +154,11 @@ def fit_grid_classifier(axes, event_axis_values, event_features, event_labels, t
     event_labels : (N,) integer class labels in [0, n_classes).
     terms : list of SplineTerm/LinearTerm applied to event_features' columns,
         shared by every cell (each cell fits its own coefficients for
-        these terms independently -- see pooled_classifier.py).
-    n_classes, C : see fit_pooled_classifier.
+        these terms independently -- see spline_classifier.py).
+    n_classes, C : see fit_spline_classifier.
     n_jobs : parallel workers across cells (joblib.Parallel) -- each cell's
         fit is completely independent of every other, so this parallelizes
-        trivially, unlike the pooled scheme.
+        trivially.
     method : default cross-cell interpolation method for the returned
         GridClassifier ("pchip" or "linear") -- can be overridden per-call
         via a different GridClassifier.method if needed.
@@ -176,7 +176,7 @@ def fit_grid_classifier(axes, event_axis_values, event_features, event_labels, t
 
     def _fit_one(idx, rows):
         rows = np.asarray(rows)
-        clf = fit_pooled_classifier(event_features[rows], event_labels[rows], terms,
+        clf = fit_spline_classifier(event_features[rows], event_labels[rows], terms,
                                      n_classes=n_classes, C=C)
         return idx, clf
 

@@ -1,299 +1,145 @@
 # coverage_kernel
 
-A conditioned-classifier kernel for coverage-dependent surface reaction
-probabilities, with a Fortran inference port meant to be embedded as a DSMC
-gas-surface boundary condition (e.g. in PICLas).
+Coverage-dependent branching probabilities for atomic oxygen hitting a surface, as a gas-surface boundary condition for direct simulation Monte Carlo (DSMC), for example in PICLas.
 
-Given a surface coverage and any number of conditioning variables (e.g. an
-incident particle's angle and velocity), the model returns
-`P(outcome | coverage, ...)` for a fixed set of outcome classes (e.g.
-adsorption/desorption channels) — either as probabilities alone, or as a
-sampled outcome plus the probability vector it was drawn from, given a
-caller-supplied uniform random deviate.
+For an incoming atom with velocity v (m/s) and polar angle θ (degrees from the surface normal), hitting a surface with coverage c (adsorbed atoms on the training patch), a model returns the probability of each outcome:
 
-Nothing about a specific dataset is hardcoded: grid size, number of outcome
-classes, `n_sites`, coverage range, spline knot count/degree, and the
-number of conditioning dimensions are all read from the fitted-model file.
-A differently-shaped dataset (a different supercell, a different
-conditioning sweep, an extra outcome channel) is served by the same code
-after a re-fit/re-export — no code changes.
+| class | outcome | coverage change |
+|---|---|---|
+| 0 | adsorption | +1 |
+| 1 | O desorption (reflection) | 0 |
+| 2 | O₂ desorption (recombination with an adsorbed atom) | −1 |
 
-Fitting happens in Python; evaluating a fitted model at run time happens in
-Fortran with no Python dependency (or in Python directly, if that's all you
-need).
+Python fits, stores and evaluates the models. Fortran evaluates them at run time without any Python dependency.
+
+## Models
+
+The package holds two model types. Both carry the same coverage physics (next section) and store to the same kind of HDF5 file.
+
+- **Neural-network ensemble (`nn_ensemble`, the working model).** Each of eight feed-forward networks (three hidden layers of 64 neurons, SiLU activation) maps the standardized velocity, the standardized angle and the coverage fraction c/48 to one logit per outcome. The O₂ logit is shifted by ln(c/48), so O₂ desorption vanishes on an empty surface by construction. The model probability is the mean over the networks, and their spread is an uncertainty estimate. The paper uses the coverage-weighted ensemble: during training, every impact is weighted by share(c)^(−0.5), where share(c) is the fraction of impacts at its coverage. This lifts the rare high coverages, where the equilibrium at small incidence angles is decided. The weighting changes which impacts dominate the fit, not the probability being fitted.
+- **Grid model (`grid`, comparison model).** One spline-logistic classifier of coverage per sampled (velocity, angle) condition, interpolated between the conditions with PCHIP (a shape-preserving cubic interpolation). Outside the sampled range, velocity is extrapolated linearly and angle is clipped.
+
+**Why the weighted ensemble is the working model.** It is smooth in velocity and angle, it shares information between neighbouring conditions, and it comes with an uncertainty. Without the weighting, a network places the equilibrium at 0° and 20° about one O atom too high. The grid model follows the data closely at every sampled condition, but it also follows their noise and gives no uncertainty. The comparison of all candidates is in `analysis/branching_models/comparison_plots/final_model_comparison/README.md`.
+
+## Coverage physics
+
+- **No O₂ at zero coverage.** The O₂ desorption probability is exactly 0 at c = 0, and the other two are renormalized.
+- **Blend beyond the sampled coverage.** The training data reach coverage 16. Each fitted model is used as is up to that highest sampled coverage. Beyond it, the probabilities blend linearly toward the endpoint without adsorption, where the adsorption probability is handed to O₂ desorption. The endpoint is reached at the ceiling of the condition. If the ceiling lies at or below 16, the switch is immediate above 16.
+- **Self-consistent ceiling.** The ceiling of a condition is the mean plus 3 standard deviations of the coverage in that condition's own coverage walk (20000 impacts, last 8000), iterated until it is stable. The networks have one ceiling per sampled (velocity, angle), interpolated linearly in between. The grid model has one per cell.
+
+The blend matters only in two cases: a condition whose equilibrium lies near 16 (normal incidence), or a surface element whose coverage was raised by other incidence conditions. A coverage walk at one fixed condition rarely leaves the sampled range.
 
 ## Install
 
 ```
 cd python
-pip install -e .[test]
+pip install -e ".[test]" --config-settings editable_mode=compat
 pytest
 ```
 
-The Fortran side is optional and only needed if you're embedding inference
-into a Fortran host code — see [Fortran side](#fortran-side) below.
+Optional extras are `train` (JAX, Flax and Optax, for network training) and `data` (pandas and znh5md, for reading the impact data). The `compat` editable mode puts `python/` on the import path. Without it, a Python session started in the repository root resolves `coverage_kernel` to the outer folder of the same name, and imports fail.
 
 ## Quickstart (Python)
 
-This fits a toy pooled model end-to-end on synthetic data, queries it, and
-round-trips it through the HDF5 format used for persistence/Fortran
-interop. No external dataset needed — copy-paste and run.
-
 ```python
-import numpy as np
-from coverage_kernel.pooled_classifier import SplineTerm, LinearTerm
-from coverage_kernel.coverage_model import CoveragePhysics, fit_coverage_pooled_model
-from coverage_kernel.export_hdf5 import export_pooled_model, load_pooled_model
+from coverage_kernel import load_model
+from coverage_kernel.coverage_model import sample_outcome, run_coverage_walk, stationary_distribution
 
-# --- toy dataset: 3 outcome classes (0=stick, 1=channel A, 2=channel B),
-# coverage in [0, 20], one extra conditioning dimension ("energy") ---
-rng = np.random.default_rng(0)
-n = 2000
-coverage = rng.integers(0, 21, n).astype(float)
-energy = rng.uniform(0, 10, n)
-p_stick = np.clip(1 - coverage / 20 - 0.05 * energy, 0.02, 0.95)
-p_a = (1 - p_stick) * 0.6
-p_b = 1 - p_stick - p_a
-labels = np.array([rng.choice(3, p=[ps, pa, pb])
-                    for ps, pa, pb in zip(p_stick, p_a, p_b)])
+model = load_model("examples/data/models/branching_nn_ensemble_weighted.h5")   # or examples/data/models/grid_model.h5
+p = model.probs(6.0, 7923.9, 40.0)               # (coverage, velocity in m/s, angle in degrees) -> 3 probabilities
+spread = [m.probs(6.0, 7923.9, 40.0) for m in model.members]   # the eight networks
 
+k, _ = sample_outcome(p, xi)                     # xi in [0, 1) from the caller's random-number stream
+coverage += model.coverage_delta[k]
 
-def feature_fn(coverage, energy):
-    """Raw feature vector fed to the classifier -- you supply this; the
-    library never assumes what your conditioning variables mean."""
-    return np.array([coverage, energy])
-
-
-X_raw = np.stack([feature_fn(c, e) for c, e in zip(coverage, energy)])
-
-physics = CoveragePhysics(n_sites=20, zeroed_zero_index=1,
-                           zeroed_full_index=0, absorbing_full_index=1)
-
-model = fit_coverage_pooled_model(
-    X_raw, labels, terms=[SplineTerm(0, n_knots=5, degree=2), LinearTerm(1)],
-    feature_fn=feature_fn, n_classes=3, physics=physics, coverage_delta=[+1, 0, -1],
-)
-
-probs = model.probs(10.0, 5.0)   # P(outcome | coverage=10, energy=5)
-print(probs)
-
-# persist to the same HDF5 format the Fortran port reads
-export_pooled_model("model.h5", model, coverage_delta=[+1, 0, -1])
-loaded, coverage_delta, _ = load_pooled_model("model.h5", feature_fn=feature_fn)
-assert np.allclose(loaded.probs(10.0, 5.0), probs)
+trace = run_coverage_walk(model.probs_fn(7923.9, 40.0), model.coverage_delta, n_steps=20000, seed=0)
 ```
 
-`SplineTerm`/`LinearTerm` say how each raw feature column enters the model
-(B-spline expansion vs. linear); `CoveragePhysics` encodes the physical
-gates (an outcome that's impossible at zero or full coverage) applied on
-top of the raw classifier fit. See [Architecture](#architecture) below for
-what each piece does.
+`examples/python/coverage_walk.py` runs this end to end. It loads both paper models, prints probabilities with the network spread, and samples single impacts. For a velocity and angle sweep it computes the zero crossing of the net O flux, the exact long-run coverage average and a Monte Carlo walk.
 
-For fitting/evaluating a real dataset instead of the toy one above, see
-`examples/python/`.
+## Training
 
-## Architecture
+- **Networks:** `coverage_kernel.nn_train.fit_coverage_nn_ensemble(velocity, angle, coverage, labels, physics=..., coverage_delta=..., gamma=0.5)`. It trains the ensemble (split seed and training seed equal to the member index, 150 epochs, no early stopping), records learning curves and computes the ceilings. The result goes to `export_hdf5.export_nn_model`. The paper's ensembles come from `analysis/branching_models/train_ensemble_nn.py`.
+- **Grid model:** `coverage_kernel.coverage_model.fit_coverage_grid_model(...)`, then `export_hdf5.export_grid_model`. The paper's grid model comes from `analysis/branching_models/grid_model/train_grid_model.py`.
+- **Impact data:** `coverage_kernel.data.load_trajectories` reads the impact files in `examples/data/` (`labelled_impacts_with_coverage/fragment_velocities_<velocity>.h5` and `starting_frames.h5`).
 
-Both the Python and Fortran sides are split into two layers:
+The file format is in `docs/hdf5_schema.md`.
 
-- **Generic core** — a conditioned multinomial-classifier evaluator that
-  knows nothing about coverage, adsorption, or any other physical meaning:
-  B-spline/linear feature terms, a present-classes-masked softmax
-  classifier, and local-window 1-D/N-D interpolation across a sampled grid.
-  Parametrized entirely by shapes read from the fitted model (number of
-  classes, number of terms, grid axis lengths, knot-vector lengths) — never
-  a compiled-in constant.
-- **Domain layer** — the coverage-specific physics on top: the
-  zero-at-zero-coverage / zero-at-full-coverage gates, the linear blend
-  toward the physically-certain full-coverage endpoint, the self-consistent
-  Monte-Carlo ceiling search (fit-time only), inverse-CDF outcome sampling,
-  and the areal-density → training-patch-coverage stochastic rounding. This
-  layer is still reusable for a *different* coverage dataset, just not for
-  an unrelated physical quantity.
+## Fortran
 
-Two fitting schemes share the generic core:
+### Building and testing
 
-- **pooled** — one classifier shared across every sampled condition, with
-  a caller-supplied `feature_fn` engineering the raw conditioning variables
-  into regression columns (see the Quickstart above, or
-  `python/coverage_kernel/features.py` for this project's own
-  coverage/normal-energy/parallel-velocity choice).
-- **grid** — one independent classifier per grid cell (e.g. a
-  (velocity, angle) grid), interpolated across the grid at query time using
-  only the local interpolation stencil around the query (≤4 grid cells per
-  axis for PCHIP, 2 for linear) — never the whole grid. This is what makes
-  inference on a fine grid cheap: evaluating one query touches only the
-  handful of cells actually needed, not every fitted cell.
-
-Both PCHIP (shape-preserving monotone cubic Hermite, matching
-`scipy.interpolate.PchipInterpolator`) and plain linear interpolation are
-supported as configurable per-grid-model methods, resolved independently
-per axis based on whether that axis's query is in its sampled range.
-
-## Directory layout
-
-```
-python/coverage_kernel/       Fitting + evaluation reference implementation (NumPy/scikit-learn)
-python/tests/                 pytest suite
-examples/python/               train_models.ipynb fits both schemes on a real trajectory
-                              dataset and exports the fitted models straight to HDF5;
-                              monte_carlo_walk.ipynb loads them and runs/validates a
-                              coverage random walk
-examples/fortran/               Worked integration example: loads the exported
-                              models and computes the same coverage-vs-
-                              (velocity,angle) heatmap as the Python notebook,
-                              entirely through MOD_CoverageKernel's public API --
-                              a template for what a DSMC boundary condition's
-                              own per-particle loop looks like
-docs/hdf5_schema.md            The self-describing HDF5 exchange format between
-                              Python fitting and Fortran inference
-fortran/src/                   The Fortran inference port (generic core + domain
-                              layer + HDF5 loader), no Python dependency at run time
-fortran/test/                   Cross-validation harness: exports a small synthetic
-                              model (and, if present, the real fitted models in
-                              examples/python/models/) to HDF5, and checks that
-                              the Fortran port reproduces the Python reference
-                              implementation's numbers
-fortran/CMakeLists.txt         Builds libcoverage_kernel + the cross-validation test
-```
-
-## Fitting and exporting a real model
-
-`examples/python/train_models.ipynb` fits both schemes on a real trajectory
-dataset (`examples/python/example_data/`) and saves them straight to HDF5 in
-`examples/python/models/`; `examples/python/monte_carlo_walk.ipynb` loads
-those, runs a coverage random walk over a wider conditioning sweep than was
-sampled, and validates extrapolation against held-out data.
-
-To export a fitted model yourself:
-
-```python
-from coverage_kernel.export_hdf5 import export_pooled_model, export_grid_model
-export_pooled_model("model.h5", pooled_model, coverage_delta=[+1, 0, -1])
-export_grid_model("model.h5", grid_model, coverage_delta=[+1, 0, -1])
-```
-
-See `docs/hdf5_schema.md` for the full file format.
-
-## Fortran side
-
-### Building
-
-Requires a Fortran 2008 compiler and an HDF5 build with Fortran bindings
-(`h5fc`/`hdf5_fortran`). CMake's `find_package(HDF5 COMPONENTS Fortran)`
-locates it (this is why `project()` also enables C — conda-forge's HDF5
-CMake config pulls in `FindThreads`, which needs a C or CXX language
-enabled even though the library itself is pure Fortran).
+You need a Fortran 2008 compiler and HDF5 with Fortran bindings. On this machine, the conda environment `coverage_kernel_fortran` has both.
 
 ```
 cd fortran
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build && cmake --build build
+python test/generate_reference_data.py          # synthetic models + the paper's grid model and weighted ensemble
+cd test && ../build/test_coverage_kernel         # Fortran vs Python, tolerance 1e-9
 ```
 
-This builds `libcoverage_kernel.a` and the `test_coverage_kernel`
-cross-validation executable. To regenerate the test's reference data (a
-small synthetic model, plus the real fitted models in
-`examples/python/models/` if present) and re-run the check:
-
-```
-python test/generate_reference_data.py   # from fortran/, needs the python/ package importable
-cd test && ../build/test_coverage_kernel
-```
-
-### Worked example: `examples/fortran/`
-
-After running `examples/python/train_models.ipynb` (which writes
-`examples/python/models/{pooled,grid}_model.h5` directly), `examples/fortran/`
-builds and runs the same way:
-
-```
-cd examples/fortran
-mkdir build && cd build
-cmake .. && cmake --build .
-cd ..
-./build/monte_carlo_walk
-```
-
-`monte_carlo_walk.f90` loads both models and, using only
-`MOD_CoverageKernel`'s public API plus Fortran's own `RANDOM_NUMBER`, runs
-a 20000-step coverage random walk at every point of the same 9×11
-(angle, velocity) sweep `examples/python/monte_carlo_walk.ipynb` uses,
-writing `heatmap_pooled.csv`/`heatmap_grid.csv`. This is meant to read as a
-template for a DSMC boundary condition's own per-particle loop: the host
-code owns the RNG stream and the per-surface-element coverage state, and
-calls `SampleCoverageOutcome` once per event.
+`examples/fortran/monte_carlo_walk.f90` runs the coverage walk of the Python example through the public API. It writes `walk_sweep_fortran.csv`, and `python examples/python/coverage_walk.py --compare` checks it against the Python results.
 
 ### Public API (`MOD_CoverageKernel`)
 
 ```fortran
 USE MOD_CoverageKernel
-
 TYPE(t_CoverageModel) :: Model
-CALL LoadCoverageModel("model.h5", Model)          ! IErr optional; see below
+CALL LoadCoverageModel("branching_nn_ensemble_weighted.h5", Model)   ! optional IErr: 1 missing file, 2 not HDF5
 
 REAL(wp) :: Probs(Model%NClasses)
-CALL EvalCoverageProbs(Model, Coverage, Angle, Velocity, Probs)
+CALL EvalCoverageProbs(Model, Coverage, Velocity, Angle, Probs)
 
-INTEGER  :: Outcome
-REAL(wp) :: DeltaCoverage
-CALL SampleCoverageOutcome(Model, Coverage, Angle, Velocity, Xi, Outcome, DeltaCoverage, Probs)
-!   Xi: caller-supplied uniform [0,1) deviate -- this module never owns an
-!   RNG, since the host DSMC code keeps its own RNG stream.
-!   Outcome is 1-based; DeltaCoverage = Model%CoverageDelta(Outcome).
+INTEGER  :: Outcome          ! 1-based
+REAL(wp) :: DeltaCoverage    ! Model%CoverageDelta(Outcome)
+CALL SampleCoverageOutcome(Model, Coverage, Velocity, Angle, Xi, Outcome, DeltaCoverage, Probs)
 
-INTEGER :: LocalCoverage
-LocalCoverage = MapAreaDensityToCoverage(Model, AreaDensity, ElementArea, Xi)
-!   Maps a surface element's areal adsorbate density onto the model's own
-!   (typically smaller) training-patch coverage via stochastic rounding.
+INTEGER :: LocalCoverage     ! adsorbed atoms on an element -> coverage of the 3.179 nm^2 training patch
+LocalCoverage = MapAdsorbateCountToCoverage(Model, AdsorbateCount, ElementArea_nm2, Xi)
 ```
 
-`LoadCoverageModel`'s `IErr` is `OPTIONAL, INTENT(OUT)`: if supplied,
-non-zero means the file couldn't be opened (the one failure mode a caller
-should expect at run time, e.g. a bad path); if omitted, that failure
-`ERROR STOP`s with a descriptive message instead. A file that opens but
-doesn't match the schema (wrong version, corrupted) is always fatal
-regardless of `IErr` — that indicates a build/deployment mistake, not a
-recoverable runtime condition.
-
-Indexing: HDF5/Python is 0-based throughout (outcome codes, gate indices);
-everything in `t_CoverageModel` and every Fortran API argument is 1-based.
-The 0→1-based conversion happens exactly once, inside
-`MOD_CoverageKernel_IO` at load time.
+- **Argument order.** Every call takes (Coverage, Velocity, Angle), as in Python.
+- **Random numbers.** The host code owns the random-number stream and the coverage of every surface element. The model is read-only after loading.
+- **HDF5 state.** Loading calls `h5open_f` but never `h5close_f`, so a host that uses HDF5 itself keeps a working library.
+- **Error handling.** A file that opens but does not match the schema stops with a message naming the failing item.
+- **No executable stack.** No internal procedure is passed as an argument, so the build needs no executable stack.
+- **Cost.** One evaluation of the eight-network ensemble costs about 70000 multiply-adds, about 18 µs on one core of this machine. A grid-model evaluation takes about 4 µs. If that is too slow for a DSMC run, tabulate the probabilities once per surface element and incidence condition at the integer coverages 0 to 48. The walk only visits whole coverages, so the table is exact.
 
 ### Module layout
 
 ```
-MOD_CoverageKernel_Types       Shared derived types (t_CoverageModel, t_PooledModel,
-                               t_GridModel, t_GridCell, t_PooledClassifier, t_Term, ...)
-MOD_CoverageKernel_BSpline     GENERIC: Cox-de Boor B-spline basis evaluation
-MOD_CoverageKernel_Interp1D    GENERIC: local-window PCHIP/linear + N-D multilinear
-MOD_CoverageKernel_Classifier  GENERIC: feature assembly + present-classes-masked softmax
-MOD_CoverageKernel_Grid        GENERIC: recursive local-stencil tensor-product grid eval
-MOD_CoverageKernel_IO          Reads the HDF5 schema into t_CoverageModel
-MOD_CoverageKernel             DOMAIN layer + public API (the only module a caller needs)
+MOD_CoverageKernel_Types       derived types (t_CoverageModel, t_NNModel, t_MLP, t_GridModel, t_SplineClassifier, ...)
+MOD_CoverageKernel_BSpline     B-spline basis (grid scheme)
+MOD_CoverageKernel_Interp1D    local PCHIP/linear interpolation, multilinear ceiling interpolation
+MOD_CoverageKernel_Classifier  spline-logistic classifier (grid cells)
+MOD_CoverageKernel_MLP         dense feed-forward network
+MOD_CoverageKernel_Grid        local-stencil interpolation across grid cells
+MOD_CoverageKernel_IO          HDF5 reader
+MOD_CoverageKernel             coverage physics + public API (the only module a caller uses)
 ```
 
-Each generic-core module is validated independently against its Python
-counterpart's behavior (see `fortran/test/`); `MOD_CoverageKernel` owns
-this project's own coverage-specific gate/blend physics and its (coverage,
-normal energy, parallel velocity) feature engineering for the pooled
-scheme — those are the one place this port isn't dataset-agnostic, by
-design (see each module's header comment for the generic/domain split
-rationale). A different physical system's pooled-scheme feature
-engineering would need its own small Fortran routine mirroring whatever
-`feature_fn` it was fit with in Python.
+## Directory layout
+
+```
+python/coverage_kernel/   nn.py (network inference), nn_train.py (training), coverage_model.py (coverage physics,
+                          walk, stationary distribution, crossing), grid_classifier.py + spline_classifier.py +
+                          bspline.py + interp1d.py (grid scheme), export_hdf5.py (files), data.py (impact data)
+python/tests/             pytest suite
+fortran/                  Fortran port, CMake build, Fortran-vs-Python test
+examples/                 coverage_walk.py (Python) and monte_carlo_walk.f90 (Fortran)
+examples/data/            models/ (the paper's weighted NN ensemble and grid model), the impact data
+                          (labelled_impacts_with_coverage/) and the starting structures (starting_frames.h5)
+docs/hdf5_schema.md       file format
+```
+
+## Validity and limitations
+
+- **Velocity and angle range.** The models are trained on 5000 to 9319 m/s and 0 to 80°. Below 5000 m/s the equilibrium coverage lies near or beyond the sampled coverage range, and the outgoing velocities depend on coverage, so the models do not apply there. Beyond 80°, the grid model clips the angle, while the networks extrapolate smoothly.
+- **Single-fragment approximation.** Impacts with several desorbing fragments count each fragment as one impact, and impacts with three or more atoms in one fragment are left out.
+- **High coverage.** Coverages of 15 and 16 rest on 6 and 2 starting structures, so the models are least certain there.
 
 ## Status
 
-The Fortran port reproduces the Python reference implementation to ~1e-9
-(double-precision, cross-language floating-point-order noise) across both
-schemes, in-range and out-of-range/extrapolated queries, the coverage==0
-gate, the deep-blend region beyond the sampled coverage range, outcome
-sampling, and density mapping — checked against both a small synthetic
-model and a real model fitted on a ~400k-event dataset.
-
-Not yet done: a hyperparameter search over spline knot count/degree,
-regularization `C`, and the MC ceiling search's parameters (`k`, step
-count) — current defaults haven't been re-tuned.
+- **Python vs Fortran.** The Fortran port reproduces the Python reference to about 1e-15 for the paper's weighted ensemble, the paper's grid model and synthetic models.
+- **Conversion.** The trained networks were converted from their original files without retraining, bit-identically (`analysis/branching_models/convert_nn_models.py`).
+- **History.** The former pooled spline scheme, its examples and tests are in `old/coverage_kernel_before_cleanup_2026-10-07/`.
